@@ -217,33 +217,33 @@ def s3_request(func):
     return wrapper
 
 
-@s3_request
-def s3_etag(url, proxies=None):
-    """Check ETag on S3 object."""
-    s3_resource = boto3.resource("s3", config=Config(proxies=proxies))
-    bucket_name, s3_path = split_s3_path(url)
-    s3_object = s3_resource.Object(bucket_name, s3_path)
-    return s3_object.e_tag
-
-
-@s3_request
-def s3_get(url, temp_file, proxies=None):
-    """Pull a file directly from S3."""
-    s3_resource = boto3.resource("s3", config=Config(proxies=proxies))
-    bucket_name, s3_path = split_s3_path(url)
-    s3_resource.Bucket(bucket_name).download_fileobj(s3_path, temp_file)
-
-
-def http_get(url, temp_file, proxies=None):
-    req = requests.get(url, stream=True, proxies=proxies)
-    content_length = req.headers.get('Content-Length')
-    total = int(content_length) if content_length is not None else None
-    progress = tqdm(unit="B", total=total)
-    for chunk in req.iter_content(chunk_size=1024):
-        if chunk: # filter out keep-alive new chunks
-            progress.update(len(chunk))
-            temp_file.write(chunk)
-    progress.close()
+# @s3_request
+# def s3_etag(url, proxies=None):
+#     """Check ETag on S3 object."""
+#     s3_resource = boto3.resource("s3", config=Config(proxies=proxies))
+#     bucket_name, s3_path = split_s3_path(url)
+#     s3_object = s3_resource.Object(bucket_name, s3_path)
+#     return s3_object.e_tag
+#
+#
+# @s3_request
+# def s3_get(url, temp_file, proxies=None):
+#     """Pull a file directly from S3."""
+#     s3_resource = boto3.resource("s3", config=Config(proxies=proxies))
+#     bucket_name, s3_path = split_s3_path(url)
+#     s3_resource.Bucket(bucket_name).download_fileobj(s3_path, temp_file)
+#
+#
+# def http_get(url, temp_file, proxies=None):
+#     req = requests.get(url, stream=True, proxies=proxies)
+#     content_length = req.headers.get('Content-Length')
+#     total = int(content_length) if content_length is not None else None
+#     progress = tqdm(unit="B", total=total)
+#     for chunk in req.iter_content(chunk_size=1024):
+#         if chunk: # filter out keep-alive new chunks
+#             progress.update(len(chunk))
+#             temp_file.write(chunk)
+#     progress.close()
 
 
 def get_from_cache(url, cache_dir=None, force_download=False, proxies=None, etag_timeout=10):

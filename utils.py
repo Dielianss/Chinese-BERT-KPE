@@ -6,83 +6,13 @@ import random
 import argparse
 import logging
 import numpy as np
-from bertkpe import evaluate_openkp, evaluate_kp20k, evaluate_chinese
+from bertkpe import evaluate_chinese
 
 logger = logging.getLogger()
 
 
 # -------------------------------------------------------------------------------------------
 # Select Input Refactor
-# -------------------------------------------------------------------------------------------
-def select_input_refactor(name):
-    if name == 'bert2span':
-        return train_input_refactor_bert2span, test_input_refactor_bert2span
-    elif name in ['bert2tag', 'bert2chunk', 'bert2rank']:
-        return train_input_refactor, test_input_refactor
-    elif name == 'bert2joint':
-        return train_input_refactor_bert2joint, test_input_refactor
-    raise RuntimeError('Invalid retriever class: %s' % name)
-
-    
-# -------------------------------------------------------------------------------------------
-# Bert2Span
-def train_input_refactor_bert2span(batch, device):
-    ex_indices = batch[-1]
-    batch = tuple(b.to(device) for b in batch[:-1])
-    inputs = {'input_ids': batch[0],
-              'attention_mask':batch[1],
-              'valid_ids':batch[2],
-              'valid_output':batch[3],
-              'active_mask':batch[4],
-              's_label':batch[5],
-              'e_label':batch[6],
-              'end_mask':batch[7]
-             }
-
-    return inputs, ex_indices
-
-
-def test_input_refactor_bert2span(batch, device):
-    ex_indices, ex_lengths = batch[-1], batch[-2]
-    batch = tuple(b.to(device) for b in batch[:-2])
-    inputs = {'input_ids':batch[0],
-              'attention_mask':batch[1],
-              'valid_ids':batch[2],
-              'valid_output':batch[3],
-              'active_mask':batch[4]
-             }        
-    return inputs, ex_indices, ex_lengths
-
-
-# -------------------------------------------------------------------------------------------
-# bert2tag, bert2chunk, bert2rank
-def train_input_refactor(batch, device):
-    # ex_indices: 当前 Batch 在整个数据集中的 起止位置
-    ex_indices = batch[-1]
-    batch = tuple(b.to(device) for b in batch[:-1])
-    inputs = {'input_ids': batch[0],
-              'attention_mask': batch[1],
-              'valid_ids': batch[2],
-              'active_mask': batch[3],
-              'valid_output': batch[4],
-              'labels': batch[5]
-             }        
-    return inputs, ex_indices
-
-
-def test_input_refactor(batch, device):
-    # ex_indices: 当前 Batch 在整个数据集中的 起止位置; ex_phrase_numbers: (所有滑动窗口下的)候选关键词个数, 即 phrase_list 的长度
-    ex_indices, ex_phrase_numbers = batch[-1], batch[-2]
-    batch = tuple(b.to(device) for b in batch[:-2])
-    inputs = {'input_ids': batch[0],
-              'attention_mask': batch[1],
-              'valid_ids': batch[2],
-              'active_mask': batch[3],
-              'valid_output': batch[4],
-             }
-    return inputs, ex_indices, ex_phrase_numbers
-
-
 # -------------------------------------------------------------------------------------------
 # bert2joint
 def train_input_refactor_bert2joint(batch, device):
@@ -97,35 +27,34 @@ def train_input_refactor_bert2joint(batch, device):
               'labels': batch[5],
               'chunk_labels': batch[6],
               'chunk_mask': batch[7],
-             }
+              }
 
     return inputs, ex_indices
+
+
+def test_input_refactor(batch, device):
+    # ex_indices: 当前 Batch 在整个数据集中的 起止位置; ex_phrase_numbers: 候选关键词集合中元素个数, 即 phrase_list 的长度
+    ex_indices, ex_phrase_numbers = batch[-1], batch[-2]
+    batch = tuple(b.to(device) for b in batch[:-2])
+    inputs = {'input_ids': batch[0],
+              'attention_mask': batch[1],
+              'valid_ids': batch[2],
+              'active_mask': batch[3],
+              'valid_output': batch[4],
+              }
+    return inputs, ex_indices, ex_phrase_numbers
 
 
 # -------------------------------------------------------------------------------------------
 # Select Prediction Arranger
 # -------------------------------------------------------------------------------------------
-def pred_arranger(tot_predictions):
-    data_dict = {}
-    for prediction in tot_predictions:
-        item = {}
-        item['url'] = prediction[0]
-        item['KeyPhrases'] = [keyphrase.split() for keyphrase in prediction[1]]
-        if len(prediction) > 2:
-            item['Scores'] = prediction[2]
-        data_dict[item['url']] = item
-    return data_dict
-
-
 def pred_arranger_chinese(tot_predictions):
     data_list = []
     for prediction in tot_predictions:
         item = {}
-
-        item['preidcted_keyphrases'] = prediction[1]
-
-        if len(prediction) > 2:
-            item['Scores'] = prediction[2]
+        item['doc_id'] = prediction[0]
+        item['predicted_keyphrases'] = prediction[1]
+        item['scores'] = prediction[2]
         data_list.append(item)
     return data_list
 
@@ -137,87 +66,28 @@ def pred_saver(args, tot_predictions, filename):
             data['url'] = url
             data['KeyPhrases'] = item['KeyPhrases']
             if "Scores" in item:
-                data['Scores'] = item['Scores']
+                data['scores'] = item['scores']
             f_pred.write("{}\n".format(json.dumps(data)))
         f_pred.close()
     logger.info('Success save %s prediction file' % filename)
-    
+
 
 # -------------------------------------------------------------------------------------------
 # Select Evaluation Scripts
 # -------------------------------------------------------------------------------------------
-
-def select_eval_script(args):
-    datset_name = args.dataset_class
-
-    return chinese_evaluate_script, "max_f1_score5"
-    
-
-# OpenKP Evaluation Script
-def openkp_evaluate_script(args, candidate, stats, mode, metric_name='max_f1_score3'):
-    logger.info("*"*80)
-    logger.info("Start Dev Evaluatng : Epoch = %d" % stats['epoch'])
-    epoch_time = Timer()
-    
-    reference_filename = os.path.join(args.preprocess_folder, 'openkp.dev_candidate.json') 
-    f1_scores, precision_scores, recall_scores = evaluate_openkp(candidate, reference_filename)
-
-    for i in precision_scores:
-        logger.info("@{}".format(i))
-        logger.info("F1:{}".format(np.mean(f1_scores[i])))
-        logger.info("P:{}".format(np.mean(precision_scores[i])))
-        logger.info("R:{}".format(np.mean(recall_scores[i])))
-        
-    f1_score3 = np.mean(f1_scores[3])
-    if f1_score3 > stats[metric_name]:
-        logger.info("-"*60)
-        stats[metric_name] = f1_score3
-        logger.info('Update ! Update ! Update ! Max f1_score3 = %.4f (epoch = %d, local_rank = %d)' 
-                    %(stats[metric_name], stats['epoch'], args.local_rank))
-        logger.info("-"*60)
-    logger.info("Local Rank = %d ||End Dev Evaluatng : Epoch = %d (Time: %.2f (s)) " 
-                %(args.local_rank, stats['epoch'], epoch_time.time()))
-    logger.info("*"*80)
-    return stats
-
-
 # KP20k Evaluation Script
-def kp20k_evaluate_script(args, candidate, stats, mode, metric_name='max_f1_score5'):
-    logger.info("*"*80)
-    logger.info("Start Evaluatng : Mode = %s || Epoch = %d" % (mode, stats['epoch']))
-    epoch_time = Timer()
-    
-    reference_filename = os.path.join(args.preprocess_folder, 'kp20k.%s_candidate.json' %mode) 
-    f1_scores, precision_scores, recall_scores = evaluate_kp20k(candidate, reference_filename)
-
-    for i in precision_scores:
-        logger.info("@{}".format(i))
-        logger.info("F1:{}".format(np.mean(f1_scores[i])))
-        logger.info("P:{}".format(np.mean(precision_scores[i])))
-        logger.info("R:{}".format(np.mean(recall_scores[i])))
-        
-    f1_score5 = np.mean(f1_scores[5])
-    if f1_score5 > stats[metric_name]:
-        logger.info("-"*60)
-        stats[metric_name] = f1_score5
-        logger.info('Update ! Update ! Update ! ||  Mode = %s || Max f1_score5 = %.4f (epoch = %d, local_rank = %d)' 
-                    % (mode, stats[metric_name], stats['epoch'], args.local_rank))
-        logger.info("-"*60)
-    logger.info("Local Rank = %d || End Evaluatng : Mode = %s || Epoch = %d (Time: %.2f (s)) " 
-                % (args.local_rank, mode, stats['epoch'], epoch_time.time()))
-    logger.info("*"*80)
-    return stats
-
-
-# chinese dataset Evaluation Script
 def chinese_evaluate_script(args, candidate, stats, mode, metric_name='max_f1_score5'):
     logger.info("*" * 80)
     logger.info("Start Evaluatng : Mode = %s || Epoch = %d" % (mode, stats['epoch']))
     epoch_time = Timer()
 
-    reference_filename = os.path.join(args.preprocess_folder, "{}_dev_candidate.json".format(args.dataset_class))
-    output_result_path = os.path.join(args.save_folder, "result.txt")
-    f1_scores, precision_scores, recall_scores = evaluate_chinese(candidate, reference_filename, output_result_path)
+    pretrained_model = 'bert' if 'roberta' not in args.pretrained_model_type else 'roberta' # 预训练模型类型
+    output_filename = os.path.join(args.result_save_path, 'result2.txt')
+    # 真实关键词保存于 cached 文件中
+    cached_filename = os.path.join(args.general_cached_features_folder, "cached.%s.%s.%s.%s.json"
+                            % (args.model_class, pretrained_model, args.dataset_class, mode))
+
+    f1_scores, precision_scores, recall_scores = evaluate_chinese(candidate, cached_filename, output_filename)
 
     for i in precision_scores:
         logger.info("@{}".format(i))
@@ -235,6 +105,7 @@ def chinese_evaluate_script(args, candidate, stats, mode, metric_name='max_f1_sc
     logger.info("Local Rank = %d || End Evaluatng : Mode = %s || Epoch = %d (Time: %.2f (s)) "
                 % (args.local_rank, mode, stats['epoch'], epoch_time.time()))
     logger.info("*" * 80)
+
     return stats
 
 
@@ -247,23 +118,24 @@ def set_seed(args):
     torch.manual_seed(args.seed)
     if args.n_gpu > 0:
         torch.cuda.manual_seed_all(args.seed)
-        
-        
+
+
 def override_args(old_args, new_args):
     ''' cover old args to new args, log which args has been changed.'''
     old_args, new_args = vars(old_args), vars(new_args)
     for k in new_args.keys():
         if k in old_args:
             if old_args[k] != new_args[k]:
-                logger.info('Overriding saved %s: %s --> %s' %(k, old_args[k], new_args[k]))
+                logger.info('Overriding saved %s: %s --> %s' % (k, old_args[k], new_args[k]))
                 old_args[k] = new_args[k]
         else:
             old_args[k] = new_args[k]
-    return argparse.Namespace(**old_args) 
+    return argparse.Namespace(**old_args)
 
 
 class AverageMeter(object):
     """Computes and stores the average and current value."""
+
     def __init__(self):
         self.reset()
 
@@ -278,8 +150,8 @@ class AverageMeter(object):
         self.sum += val * n
         self.count += n
         self.avg = self.sum / self.count
-        
-        
+
+
 class Timer(object):
     """Computes elapsed time."""
 

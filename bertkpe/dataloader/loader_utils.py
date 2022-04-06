@@ -1,5 +1,6 @@
 import os
 import json
+import codecs
 import logging
 import unicodedata
 from tqdm import tqdm
@@ -13,14 +14,14 @@ from .bert2tag_dataloader import (bert2tag_preprocessor, bert2tag_converter)
 from .bert2chunk_dataloader import (bert2chunk_preprocessor, bert2chunk_converter)
 
 from .bert2rank_dataloader import (bert2rank_preprocessor, bert2rank_converter)
-from .bert2joint_dataloader import (bert2joint_preprocessor, bert2joint_preprocessor_test, bert2joint_converter)
+from .bert2joint_dataloader import (bert2joint_preprocessor_chinese, bert2joint_converter)
 
 
 example_preprocessor = {'bert2span': bert2span_preprocessor,
                         'bert2tag': bert2tag_preprocessor,
                         'bert2chunk': bert2chunk_preprocessor,
                         'bert2rank': bert2rank_preprocessor,
-                        'bert2joint': bert2joint_preprocessor}
+                        'bert2joint': bert2joint_preprocessor_chinese}
 
 feature_converter = {'bert2span': bert2span_converter,
                      'bert2tag': bert2tag_converter,
@@ -33,25 +34,25 @@ logger = logging.getLogger()
 
 
 # -------------------------------------------------------------------------------------------
-# -------------------------------------------------------------------------------------------
 # load & save source dataset
 def load_dataset(file_path):
     """ Load file.jsonl ."""
     data_list = []
     with open(file_path, mode='r', encoding='utf-8') as fi:
-        for idx, line in enumerate(tqdm(fi)):
+        for idx, line in enumerate(fi):
             jsonl = json.loads(line)
             data_list.append(jsonl)
 
-    logger.info('success load %d data'%len(data_list))
+    logger.info('successfully load %d data' % len(data_list))
     return data_list
 
 
 def save_dataset(data_list, filename):
     with open(filename, 'w', encoding='utf-8') as fo:
         for data in tqdm(data_list):
-            fo.write("{}\n".format(json.dumps(data)))
+            fo.write("{}\n".format(json.dumps(data, ensure_ascii=False)))
         fo.close()
+
     logger.info("Success save %d data to %s" % (len(data_list), filename))
     
     
@@ -61,36 +62,42 @@ def save_dataset(data_list, filename):
 class build_dataset(Dataset):
     ''' build datasets for train & eval '''
     def __init__(self, args, tokenizer, mode):
-        pretrain_model = 'bert' if 'roberta' not in args.pretrain_model_type else 'roberta'
+        pretrained_model = 'bert' if 'roberta' not in args.pretrained_model_type else 'roberta'
         # --------------------------------------------------------------------------------------------
         # try to reload cached features
-        try:
-            cached_examples = reload_cached_features(**{'cached_features_dir': args.cached_features_dir,
-                                                        'model_class': args.model_class,
-                                                        'dataset_class': args.dataset_class,
-                                                        'pretrain_model': pretrain_model,
-                                                        'mode': mode})
+        cached_example_path = os.path.join(args.general_cached_features_folder,
+                                           "cached.%s.%s.%s.%s.json"
+                                           % (args.model_class, pretrained_model, args.dataset_class, mode)
+                                           )
+        if os.path.exists(cached_example_path):
+            logger.info("loading test data at {}".format(cached_example_path))
+            cached_examples = reload_cached_features(cached_example_path)
         # --------------------------------------------------------------------------------------------
         # restart preprocessing features
-        except:
-            logger.info("start loading source %s %s data ..." % (args.dataset_class, mode))
+        else:
+            logger.info("cached test data does not exist at {}".format(os.path.join(args.general_cached_features_folder,
+                                                                                    args.model_class)))
+            logger.info("start creating...")
+            logger.info("reading raw test data at: {}".format(os.path.join(args.preprocess_folder,
+                                                                           "%s.%s.json" % (args.dataset_class, mode))))
+
             examples = load_dataset(os.path.join(args.preprocess_folder, "%s.%s.json" % (args.dataset_class, mode)))
 
-            cached_examples = bert2joint_preprocessor_test(**{'examples': examples,
-                                                                        'tokenizer': tokenizer,
-                                                                        'max_token': args.max_token,
-                                                                        'pretrain_model': pretrain_model,
-                                                                        'mode': mode,
-                                                                        'max_phrase_words': args.max_phrase_words,
-                                                                        'stem_flag': False})
+            # bert2joint 的 preprocessor 已替换为中文的
+            preprocessor = example_preprocessor[args.model_class]
+            cached_examples = preprocessor(**{'examples': examples, 'tokenizer': tokenizer,
+                                              'max_token': args.max_token, 'pretrain_model': pretrained_model,
+                                              'mode': mode, 'max_phrase_words': args.max_phrase_words
+                                              })
 
             if args.local_rank in [-1, 0]:
                 save_cached_features(**{'cached_examples': cached_examples,
-                                        'cached_features_dir': args.cached_features_dir,
+                                        'cached_features_dir': args.general_cached_features_folder,
                                         'model_class': args.model_class,
                                         'dataset_class': args.dataset_class,
-                                        'pretrain_model': pretrain_model,
+                                        'pretrain_model': pretrained_model,
                                         'mode': mode})
+
         # --------------------------------------------------------------------------------------------
         self.mode = mode
         self.tokenizer = tokenizer
@@ -111,33 +118,32 @@ class build_dataset(Dataset):
 # -------------------------------------------------------------------------------------------
 # pre-trained model tokenize
 def tokenize_for_bert(doc_words, tokenizer):
-    # vaild_mask: 若 token不含 sub_token, 记为 1, 若 token 含有 sub_token, 则首个 sub_token记为 1, 其后 sub_tokens 记为 0
-    # vaild_mask中 1的 个数即为 词的总数
+    # valid_mask: 对 doc_words 中的 所有 token 执行如下编码:
+    # token 中的 首个 sub_token记为 1, 其后所有 sub_tokens 记为 0, 1 的 个数即为 token的总数
     valid_mask = []
-    # 将 (预处理时的) 分词结果 (tokens) 使用 Bert 拆分为 sub_tokens, 例如 ["unhappy"] --> ["un", "happy"]
-    all_doc_tokens = []
-    # 记录 每一个 sub_tokens 所在的那个 token 在 预处理时的分词结果 (tokens) 中 的序号
+    # 使用 tokenizer 对 token(若干字组成) 再次分词, 将所有 sub_token(单字) 存入 all_sub_tokens, 例如 ["快乐", "中国"] --> ["快", "乐", "中", "国"]
+    all_sub_tokens = []
+    # 记录 每一个 sub_tokens 属于 doc_words 中 第几个 token
     tok_to_orig_index = []
     # 记录 预处理时的分词结果 (tokens) 中的 每个 token 中的 首个 sub_token 在 sub_tokens 中的 位置
     orig_to_tok_index = []
 
-    tmp_orig_to_tok_index = 0
     for (i, token) in enumerate(doc_words):
-        orig_to_tok_index.append(len(all_doc_tokens))
-        # sorig_to_tok_index.append(tmp_orig_to_tok_index)
+        orig_to_tok_index.append(len(all_sub_tokens))   # len(all_sub_token) 为先前 sub_tokens 的总数
+                                                        # ===> 0 ~ len -1 为 先前所有 sub_tokens 的序号
+                                                        # len 可作为 当前 token 的首 sub_token 在 所有 sub_tokens 中的 序号
         sub_tokens = tokenizer.tokenize(token)
         if len(sub_tokens) < 1:
             sub_tokens = [UNK_WORD]
         for num, sub_token in enumerate(sub_tokens):
-            tmp_orig_to_tok_index += 1
-            tok_to_orig_index.append(i)
-            all_doc_tokens.append(sub_token)
+            tok_to_orig_index.append(i)         # 该 sub_token 属于 doc_words 中的 第 i 个 token
+            all_sub_tokens.append(sub_token)    # 保存 每个 sub_token
             if num == 0:
-                valid_mask.append(1)
+                valid_mask.append(1)            # token 中的 首个 sub_token 记为 1
             else:
-                valid_mask.append(0)
+                valid_mask.append(0)            # token 中 非首个 sub_token 记为 0
 
-    return {'tokens': all_doc_tokens,
+    return {'sub_tokens': all_sub_tokens,
             'valid_mask': valid_mask,
             'tok_to_orig_index': tok_to_orig_index,
             'orig_to_tok_index': orig_to_tok_index}
@@ -146,16 +152,11 @@ def tokenize_for_bert(doc_words, tokenizer):
 # -------------------------------------------------------------------------------------------
 # -------------------------------------------------------------------------------------------
 # load & save cached features
-def reload_cached_features(cached_features_dir, model_class, 
-                          dataset_class, pretrain_model, mode):
-    logger.info("start reloading:  %s (%s) for %s (%s) cached features ..." 
-                %(model_class, pretrain_model, dataset_class, mode))
-    filename = os.path.join(cached_features_dir, "cached.%s.%s.%s.%s.json" 
-                            %(model_class, pretrain_model, dataset_class, mode))
+def reload_cached_features(filename: str):
     data_list = []
 
     with open(filename, "r", encoding="utf-8") as file:
-        for idx, line in enumerate(tqdm(file)):
+        for idx, line in enumerate(file):
             jsonl = json.loads(line)
             data_list.append(jsonl)
         return data_list

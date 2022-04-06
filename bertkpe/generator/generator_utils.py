@@ -37,7 +37,15 @@ def remove_empty_phase(phrases_scores):
                 phrase_list.append(normalize_answer(phrase))
                 score_list.append(score)
     return phrase_list, score_list
-    
+
+
+def remove_empty_phase_chinese(phrases_scores):
+    phrase_list = []
+    score_list = []
+    for phrase, score in phrases_scores:
+        phrase_list.append(phrase)
+        score_list.append(score)
+    return phrase_list, score_list
 
 
 def stem_norm_phrase(phrase):

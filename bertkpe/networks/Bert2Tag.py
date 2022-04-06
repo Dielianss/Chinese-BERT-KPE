@@ -9,7 +9,6 @@ from ..transformers import BertForTokenClassification
 logger = logging.getLogger()
 
 
-
 class BertForSeqTagging(BertForTokenClassification):
     def forward(self, input_ids, attention_mask, valid_ids, active_mask, valid_output, labels=None):
         

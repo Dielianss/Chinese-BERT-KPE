@@ -6,18 +6,22 @@ import logging
 import argparse
 import traceback
 from tqdm import tqdm
+from transformers import BertTokenizer
 
 sys.path.append(".")
-import test
+os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 import utils
 import config
+from test import bert2rank_decoder
 from model import KeyphraseSpanExtraction
-from utils import pred_arranger, pred_arranger_chinese, pred_saver
-from bertkpe import dataloader, generator, evaluator
-from bertkpe import tokenizer_class, Idx2Tag, Tag2Idx, Decode_Candidate_Number
+from utils import pred_arranger_chinese, chinese_evaluate_script, train_input_refactor_bert2joint, test_input_refactor
+from bertkpe import dataloader
+# Select dataloader
+from bertkpe.dataloader.bert2joint_dataloader import batchify_bert2joint_features_for_train, batchify_bert2joint_features_for_test
 torch.backends.cudnn.benchmark = True
 from torch.utils.data.distributed import DistributedSampler
 from tensorboardX import SummaryWriter
+
 logger = logging.getLogger()
 
 
@@ -27,16 +31,16 @@ logger = logging.getLogger()
 def train(args, data_loader, model, train_input_refactor, stats, writer):
     logger.info("start training %s on %s (%d epoch) || local_rank = %d..." %
                 (args.model_class, args.dataset_class, stats['epoch'], args.local_rank))
-    
+
     train_loss = utils.AverageMeter()
     epoch_time = utils.Timer()
-    
+
     epoch_loss = 0
     epoch_step = 0
-    
+
     epoch_iterator = tqdm(data_loader, desc="Train_Iteration", disable=args.local_rank not in [-1, 0])
 
-    # data_loader 中定义了 __getitem__ 方法, 迭代取数据时对数据完成预处理 (例如 bert2joint_converter),再返回值(即 batch)
+    # data_loader 中定义了 __getitem__ 方法, 在迭代取数据时还会对其进一步做处理,生成 batch, 再喂入模型
     for step, batch in enumerate(epoch_iterator):
         # inputs: 将预处理完的数据整理为存入 dict
         inputs, indices = train_input_refactor(batch, model.args.device)
@@ -45,22 +49,26 @@ def train(args, data_loader, model, train_input_refactor, stats, writer):
         except:
             logging.error(str(traceback.format_exc()))
             continue
-            
+
         train_loss.update(loss)
         epoch_loss += loss
         epoch_step += 1
-        
+
         if args.local_rank in [-1, 0] and step % args.display_iter == 0:
             if args.use_viso:
                 writer.add_scalar('train/loss', train_loss.avg, model.updates)
                 writer.add_scalar('train/lr', model.scheduler.get_lr()[0], model.updates)
 
+            # logging.info('Local Rank = %d | train: Epoch = %d | iter = %d/%d | ' %
+            #             (args.local_rank, stats['epoch'], step, len(train_data_loader)) +
+            #             'loss = %.4f | lr = %f | %d updates | elapsed time = %.2f (s) \n' %
+            #             (train_loss.avg, model.scheduler.get_lr()[0], model.updates, stats['timer'].time()))
             train_loss.reset()
 
     logging.info('Local Rank = %d | Epoch Mean Loss = %.8f ( Epoch = %d ) | Time for epoch = %.2f (s) \n' %
                  (args.local_rank, (epoch_loss / epoch_step), stats['epoch'], epoch_time.time()))
-        
-    
+
+
 # -------------------------------------------------------------------------------------------
 # Main Function
 # -------------------------------------------------------------------------------------------
@@ -70,14 +78,9 @@ if __name__ == "__main__":
     config.add_default_args(parser)
     args = parser.parse_args()
     config.init_args_config(args)
-    # -------------------------------------------------------------------------------------------
-    # Setup distant debugging if needed
-    if args.server_ip and args.server_port:
-        # Distant debugging - see https://code.visualstudio.com/docs/python/debugging#_attach-to-a-local-script
-        import ptvsd
-        print("Waiting for debugger attach")
-        ptvsd.enable_attach(address=(args.server_ip, args.server_port), redirect_output=True)
-        ptvsd.wait_for_attach()
+
+    output_filename = os.path.join(args.result_save_path, 'result.txt')
+
     # -------------------------------------------------------------------------------------------
     # Setup CUDA, GPU & distributed training
     args.cuda = not args.no_cuda and torch.cuda.is_available()
@@ -93,23 +96,26 @@ if __name__ == "__main__":
         device = torch.device("cuda", args.local_rank)
         torch.distributed.init_process_group(backend='nccl')
         args.n_gpu = 1
-    args.device = device
-    logger.info("Process rank: %s, device: %s, n_gpu: %s, distributed training: %s, 16-bits training: %s",
-                args.local_rank, device, args.n_gpu, bool(args.local_rank != -1), args.fp16)
 
+    args.device = device
+    logger.info("process rank: %s, device: %s, n_gpu: %s, distributed training: %s, 16-bits training: %s",
+                args.local_rank, device, args.n_gpu, bool(args.local_rank != -1), args.fp16)
+    print()
     # -------------------------------------------------------------------------------------------
     utils.set_seed(args)
-    # Make sure only the first process in distributed training will download model & vocab
-        
-    # -------------------------------------------------------------------------------------------
-    # init tokenizer & Converter 
-    logger.info("start setting tokenizer, dataset and dataloader (local_rank = {})... ".format(args.local_rank))
 
-    tokenizer = tokenizer_class[args.pretrain_model_type].from_pretrained(args.cache_dir)
-    # -------------------------------------------------------------------------------------------
-    # Select dataloader
-    batchify_features_for_train, batchify_features_for_test = dataloader.get_class(args.model_class)
+    # 预处理语料选取器, 从 预处理语料 中 选取适当的字段 用于模型的 训练/推断
+    train_input_refactor, test_input_refactor = train_input_refactor_bert2joint, test_input_refactor
+    # Bert 分词器
+    tokenizer = BertTokenizer.from_pretrained(args.pretrained_model_dir)
+    # 模型推断主函数
+    candidate_decoder = bert2rank_decoder
+    # 从 推断结果中 提取 必要的字段 用于计算指标
+    dataset_pred_arranger = pred_arranger_chinese
+    # 计算脚本选择
+    evaluate_script, main_metric_name = chinese_evaluate_script, "max_f1_score5"
 
+    # -------------------------------------------------------------------------------------------
     if args.run_mode == "eval":
         model, checkpoint_epoch = KeyphraseSpanExtraction.load_checkpoint(args.checkpoint_file, args)
         # set model device
@@ -124,39 +130,37 @@ if __name__ == "__main__":
             batch_size=args.test_batch_size,
             sampler=dev_sampler,
             num_workers=args.data_workers,
-            collate_fn=batchify_features_for_test,
+            collate_fn=batchify_bert2joint_features_for_test,
             pin_memory=args.cuda,
         )
-        logger.info("Successfully Preprocess Dev Features !")
+        logger.info("Successfully load cached test features!")
+        print()
 
-        dataset_pred_arranger = pred_arranger_chinese
-
-        # 预处理语料选取器, 从 预处理语料中选取适当的字段 用于训练
-        train_input_refactor, test_input_refactor = utils.select_input_refactor(args.model_class)
-        # Method Select
-        candidate_decoder = test.select_decoder(args.model_class)
-        evaluate_script, main_metric_name = utils.select_eval_script(args)
         # decode candidate phrases
         dev_candidate = candidate_decoder(args, dev_data_loader, dev_dataset, model, test_input_refactor,
                                           dataset_pred_arranger, 'dev')
         stats = {'timer': utils.Timer(), 'epoch': 0, main_metric_name: 0}
-        stats = evaluate_script(args, dev_candidate, stats, mode='dev', metric_name=main_metric_name)
+
+        # 当测试集提供关键词时, 计算指标
+        if args.keyphrase_in_test_data:
+            stats = evaluate_script(args, dev_candidate, stats, mode='dev', metric_name=main_metric_name)
 
     else:
-        # -------------------------------------------------------------------------------------------
+        # 在 训练 模式下, 使用 自己实现的 MyDataset 加载训练集, MyDataset 不会一次性将全部数据都读入内存, 对大文件更友好
         train_dataset = dataloader.MyDataset(**{'args': args, 'tokenizer': tokenizer, 'mode': 'train'})
         args.train_batch_size = args.per_gpu_train_batch_size * max(1, args.n_gpu)
-        train_sampler = torch.utils.data.sampler.RandomSampler(train_dataset) if args.local_rank == -1 else DistributedSampler(train_dataset)
+        train_sampler = torch.utils.data.sampler.RandomSampler(
+            train_dataset) if args.local_rank == -1 else DistributedSampler(train_dataset)
         train_data_loader = torch.utils.data.DataLoader(
             train_dataset,
             batch_size=args.train_batch_size,
             # sampler=train_sampler,
             num_workers=args.data_workers,
-            collate_fn=batchify_features_for_train,
+            collate_fn=batchify_bert2joint_features_for_train,
             pin_memory=args.cuda,
         )
-        logger.info("Successfully Preprocess Training Features!")
-
+        logger.info("Successfully load cached train features!")
+        print()
         # -------------------------------------------------------------------------------------------
         dev_dataset = dataloader.build_dataset(**{'args': args, 'tokenizer': tokenizer, 'mode': 'dev'})
         args.test_batch_size = args.per_gpu_test_batch_size * max(1, args.n_gpu)
@@ -166,25 +170,11 @@ if __name__ == "__main__":
             batch_size=args.test_batch_size,
             sampler=dev_sampler,
             num_workers=args.data_workers,
-            collate_fn=batchify_features_for_test,
+            collate_fn=batchify_bert2joint_features_for_test,
             pin_memory=args.cuda,
         )
-        logger.info("Successfully Preprocess Dev Features !")
-
-        # -------------------------------------------------------------------------------------------
-        # build eval dataloader only for kp20k
-        if args.dataset_class in ['kp20k']:
-            eval_dataset = dataloader.build_dataset(**{'args': args, 'tokenizer': tokenizer, 'mode': 'eval'})
-            eval_sampler = torch.utils.data.sampler.SequentialSampler(eval_dataset)
-            eval_data_loader = torch.utils.data.DataLoader(
-                eval_dataset,
-                batch_size=args.test_batch_size,
-                sampler=eval_sampler,
-                num_workers=args.data_workers,
-                collate_fn=batchify_features_for_test,
-                pin_memory=args.cuda,
-            )
-            logger.info("Successfully Preprocess Eval Features !")
+        logger.info("Successfully load cached test features!")
+        print()
 
         # -------------------------------------------------------------------------------------------
         # Set training total steps
@@ -194,7 +184,7 @@ if __name__ == "__main__":
         # Preprare Model & Optimizer
         # -------------------------------------------------------------------------------------------
         if args.local_rank not in [-1, 0]:
-            torch.distributed.barrier()
+            torch.distributed.barrier()  # Make sure only the first process in distributed training will download model & vocab
 
         logger.info(" ************************** Initilize Model & Optimizer ************************** ")
         if args.load_checkpoint and os.path.isfile(args.checkpoint_file):
@@ -208,13 +198,8 @@ if __name__ == "__main__":
             model = KeyphraseSpanExtraction(args)
             start_epoch = 1
 
+        # initial optimizer
         model.init_optimizer(num_total_steps=t_total)
-
-        # -------------------------------------------------------------------------------------------
-        if args.local_rank == 0:
-            torch.distributed.barrier()  # Make sure only the first process in distributed training will download model & vocab
-        # -------------------------------------------------------------------------------------------
-
         # set model device
         model.set_device()
 
@@ -229,34 +214,13 @@ if __name__ == "__main__":
         else:
             tb_writer = None
 
-        logger.info("Training/evaluation parameters %s", args)
-        logger.info(" ************************** Running training ************************** ")
-        logger.info("  Num Train examples = %d", len(train_dataset))
-        logger.info("  Num Train Epochs = %d", args.max_train_epochs)
-        logger.info("  Instantaneous batch size per GPU = %d", args.per_gpu_train_batch_size)
-        logger.info("  Total train batch size (w. parallel, distributed & accumulation) = %d",
-                    args.train_batch_size * args.gradient_accumulation_steps * (torch.distributed.get_world_size() if args.local_rank != -1 else 1))
-        logger.info("  Gradient Accumulation steps = %d", args.gradient_accumulation_steps)
-        logger.info("  Total optimization steps = %d", t_total)
-        logger.info(" *********************************************************************** ")
-
-        # -------------------------------------------------------------------------------------------
-        # Method Select
-        candidate_decoder = test.select_decoder(args.model_class)
-        evaluate_script, main_metric_name = utils.select_eval_script(args)
-
-        # 预处理语料选取器, 从 预处理语料 中选取适当的字段 用于训练
-        train_input_refactor, test_input_refactor = utils.select_input_refactor(args.model_class)
-
         # -------------------------------------------------------------------------------------------
         # start training
         # -------------------------------------------------------------------------------------------
         model.zero_grad()
         stats = {'timer': utils.Timer(), 'epoch': 0, main_metric_name: 0}
 
-        dataset_pred_arranger = pred_arranger_chinese
-
-        for epoch in range(start_epoch, (args.max_train_epochs+1)):
+        for epoch in range(start_epoch, (args.max_train_epochs + 1)):
             stats['epoch'] = epoch
             # train
             train(args, train_data_loader, model, train_input_refactor, stats, tb_writer)
@@ -265,13 +229,17 @@ if __name__ == "__main__":
             prev_metric_score = stats[main_metric_name]
 
             # decode candidate phrases
-            dev_candidate = candidate_decoder(args, dev_data_loader, dev_dataset, model, test_input_refactor, dataset_pred_arranger, 'dev')
+            dev_candidate = candidate_decoder(args, dev_data_loader, dev_dataset, model, test_input_refactor,
+                                              dataset_pred_arranger, 'dev')
             stats = evaluate_script(args, dev_candidate, stats, mode='dev', metric_name=main_metric_name)
 
             # new metric score
             new_metric_score = stats[main_metric_name]
 
             # save checkpoint : when new metric score > previous metric score
-            if args.save_checkpoint and (new_metric_score > prev_metric_score) and (args.local_rank == -1 or torch.distributed.get_rank() == 0):
-                checkpoint_name = '{}.{}.{}.epoch_{}.checkpoint'.format(args.model_class, args.dataset_class, args.pretrain_model_type.split('-')[0], epoch)
+            if args.save_checkpoint and (new_metric_score > prev_metric_score) and (
+                    args.local_rank == -1 or torch.distributed.get_rank() == 0):
+                checkpoint_name = '{}.{}.{}.epoch_{}.checkpoint'.format(args.model_class, args.dataset_class,
+                                                                        args.pretrained_model_type.split('-')[0], epoch)
+
                 model.save_checkpoint(os.path.join(args.checkpoint_folder, checkpoint_name), stats['epoch'])

@@ -33,7 +33,7 @@ def get_class(args):
     elif args.model_class == 'bert2joint' and args.pretrain_model_type == 'roberta-base':
         return RobertaForChunkTFRanking
 
-    raise RuntimeError('Invalid retriever class: %s' % name)
+    raise RuntimeError('Invalid retriever class: %s' % "args.model_class")
 
 
 # bert2span

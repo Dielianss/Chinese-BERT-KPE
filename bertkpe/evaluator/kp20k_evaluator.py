@@ -65,11 +65,16 @@ def get_match_scores(pred_list, truth_list):
     return match_score
 
 
-def get_match_scores_chinese(pred_list, truth_list):
+def get_match_scores_chinese(pred_list, true_list):
+    """
+    :param pred_list: 预测关键词 列表
+    :param true_list: 真实关键词列表
+    :return:
+    """
     match_score = np.asarray([0.0] * len(pred_list), dtype='float32')
 
     for pred_id, pred_seq in enumerate(pred_list):
-        if pred_seq in truth_list:
+        if pred_seq in true_list:
             match_score[pred_id] = 1
     return match_score
 # ----------------------------------------------------------------------------
@@ -143,26 +148,32 @@ def evaluate_kp20k(candidate, reference_filename):
         logger.info("Candidate file and Reference are not comparable. Please verify your candidate file.")
 
 
-def evaluate_chinese(candidate, reference_filename, output_file_path):
+def evaluate_chinese(predicted_keywords, cached_file_path, output_file_path):
+    """
+    :param predicted_keywords: 预测结果
+    :param cached_file_path:   cached 文件
+    :param output_file_path:   结果保存文件
+    :return:
+    """
+
     precision_scores, recall_scores, f1_scores = {1: [], 3: [], 5: []}, \
                                                  {1: [], 3: [], 5: []}, \
                                                  {1: [], 3: [], 5: []}
 
-    with open(reference_filename, 'r') as f, open(output_file_path, "w", encoding="utf-8") as output_file:
-        for l, j in zip(f, candidate):
+    with open(cached_file_path, 'r') as input_file, open(output_file_path, 'w') as output_file:
+        for l, j in zip(input_file, predicted_keywords):
             item = json.loads(l)
             true_keyphrases = []
             for keyword in item["keyphrases"]:
-                true_keyphrases.append("".join(keyword))
+                true_keyphrases.append("".join(keyword).lower())  # 真实的关键词会小写化
 
-            pred_keyphrases = j['preidcted_keyphrases']
-            item['preidcted_keyphrases'] = j['preidcted_keyphrases']
+            pred_keyphrases = []
+            for pred_keyphrase in j["predicted_keyphrases"]:
+                pred_keyphrases.append("".join(pred_keyphrase).lower())
+                if len(pred_keyphrases) == 5:
+                    break
 
-            item['scores'] = j['Scores']
-            json.dump(item, output_file, ensure_ascii=False)
-            output_file.write("\n")
-
-            match_list = get_match_scores_chinese(pred_keyphrases, true_keyphrases)
+            match_list = get_match_scores_chinese(pred_keyphrases, true_keyphrases)  # 统计每个预测关键词是否预测正确, 1 为预测对, 0 为预测错
             # Padding
             if len(match_list) < 5:
                 for _ in range(5 - len(match_list)):
@@ -184,5 +195,9 @@ def evaluate_chinese(candidate, reference_filename, output_file_path):
                 precision_scores[topk].append(micropk)
                 recall_scores[topk].append(micrork)
                 f1_scores[topk].append(microf1)
+
+            output_file.write("{}\n".format(json.dumps({"doc_id": j["doc_id"], "predicted_keyphrases": pred_keyphrases,
+                                                        "keyphrases": true_keyphrases,
+                                                        }, ensure_ascii=False)))
 
     return f1_scores, precision_scores, recall_scores

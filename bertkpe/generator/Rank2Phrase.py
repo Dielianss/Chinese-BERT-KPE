@@ -1,5 +1,6 @@
 import logging
-from .generator_utils import remove_empty, remove_empty_phase, del_stemming_duplicate_phrase
+import numpy as np
+from .generator_utils import remove_empty, remove_empty_phase_chinese, remove_empty_phase, del_stemming_duplicate_phrase
 
 logger = logging.getLogger()
 
@@ -29,23 +30,23 @@ def rank2phrase(examples, logit_lists, indices, stem_flag=False, return_num=None
     return batch_predictions
 
 
-def rank2phrase_chinese(examples, logit_lists, indices, stem_flag=False, return_num=None):
+def rank2phrase_chinese(examples, logit_lists, indices, return_num=None):
     batch_predictions = []
     for batch_id, logit_list in enumerate(logit_lists):
         example = examples[indices[batch_id]]
-
+        # phrase_list: 候选关键词集合
         params = {'gram_list': example['phrase_list'],
                   'score_logits': logit_list}
+        phrase_len = sum(example['valid_mask'])
         n_best_phrases_scores = decode_n_best_candidates(**params)
-        candidate_KP, score_KP = remove_empty_phase(n_best_phrases_scores)
+
+        candidate_KP, score_KP = remove_empty_phase_chinese(n_best_phrases_scores)
 
         if return_num:
             candidate_KP = candidate_KP[:return_num]
             score_KP = score_KP[:return_num]
-            if len(candidate_KP) != return_num:
-                print(len(candidate_KP), candidate_KP)
 
-        batch_predictions.append((example['doc_id'], candidate_KP, score_KP))
+        batch_predictions.append((example['doc_id'], candidate_KP, score_KP, params, phrase_len))
 
     return batch_predictions
 
